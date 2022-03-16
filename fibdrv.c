@@ -1,3 +1,4 @@
+#include <asm/uaccess.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -6,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/slab.h>
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -17,26 +19,114 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 92
+#define MAX_LENGTH 500
 
 static dev_t fib_dev = 0;
 static struct cdev *fib_cdev;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 
-static long long fib_sequence(long long k)
+static ktime_t kt;
+
+static char *add_two_string(char *num1, char *num2)
 {
-    /* FIXME: C99 variable-length array (VLA) is not allowed in Linux kernel. */
-    long long f[k + 2];
+    int idx1 = strlen(num1) - 1;
+    int idx2 = strlen(num2) - 1;
 
-    f[0] = 0;
-    f[1] = 1;
-
-    for (int i = 2; i <= k; i++) {
-        f[i] = f[i - 1] + f[i - 2];
+    int n = idx1 > idx2 ? strlen(num1) : strlen(num2);
+    char *ret = kzalloc((n + 2) * sizeof(char), GFP_KERNEL);
+    if (!ret) {
+        printk(KERN_INFO "[%s] Cannot get memory with size %d\n", __func__,
+               n + 2);
+        return NULL;
     }
 
-    return f[k];
+    int idxRet = n;
+    int carry = 0;
+
+    while (idx1 >= 0 || idx2 >= 0) {
+        int sum = 0;
+
+        if (idx1 >= 0) {
+            sum += num1[idx1] - '0';
+            idx1--;
+        }
+        if (idx2 >= 0) {
+            sum += num2[idx2] - '0';
+            idx2--;
+        }
+        sum += carry;
+        carry = sum / 10;
+        ret[idxRet] = sum % 10 + '0';
+        idxRet--;
+    }
+
+    if (carry) {
+        ret[idxRet] = '1';
+        idxRet--;
+    }
+
+    return &(ret[idxRet + 1]);
+}
+
+static int fib_sequence(char **f, long long k)
+{
+    f[0] = kzalloc(sizeof(char) + 1, GFP_KERNEL);
+    f[1] = kzalloc(sizeof(char) + 1, GFP_KERNEL);
+    strncpy(f[0], "0", 2);
+    strncpy(f[1], "1", 2);
+
+    for (int i = 2; i <= k; i++) {
+        f[i] = add_two_string(f[i - 1], f[i - 2]);
+        if (f[i] == NULL)
+            return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static int fib_time_proxy(char **f, long long k)
+{
+    kt = ktime_get();
+    int ret = fib_sequence(f, k);
+    kt = ktime_sub(ktime_get(), kt);
+
+    return ret;
+}
+
+/* calculate the fibonacci number at given offset */
+static ssize_t fib_read(struct file *file,
+                        char *buf,
+                        size_t size,
+                        loff_t *offset)
+{
+    char **f;
+
+    if (*offset > 1)
+        f = kmalloc((*offset + 1) * sizeof(f), GFP_KERNEL);
+    else
+        f = kmalloc(3 * sizeof(f), GFP_KERNEL);
+
+    if (!f) {
+        printk(KERN_INFO "[%s] Cannot get memory with size %lld\n", __func__,
+               (*offset + 1));
+        return -ENOMEM;
+    }
+
+    int ret = fib_time_proxy(f, *offset);
+    if (ret < 0)
+        return ret;
+
+    /*
+     * Copy at most size bytes to user space.
+     * Return ''0'' on success and some other value on error.
+     */
+    if (copy_to_user(buf, f[*offset], strlen(f[*offset]) + 1))
+        return -EFAULT;
+    else
+        return 0;
+
+    return (strlen(f[*offset]) + 1);
 }
 
 static int fib_open(struct inode *inode, struct file *file)
@@ -54,22 +144,13 @@ static int fib_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-/* calculate the fibonacci number at given offset */
-static ssize_t fib_read(struct file *file,
-                        char *buf,
-                        size_t size,
-                        loff_t *offset)
-{
-    return (ssize_t) fib_sequence(*offset);
-}
-
 /* write operation is skipped */
 static ssize_t fib_write(struct file *file,
                          const char *buf,
                          size_t size,
                          loff_t *offset)
 {
-    return 1;
+    return ktime_to_ns(kt);
 }
 
 static loff_t fib_device_lseek(struct file *file, loff_t offset, int orig)
