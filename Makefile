@@ -39,3 +39,12 @@ check: all
 	$(MAKE) unload
 	@diff -u out scripts/expected.txt && $(call pass)
 	@scripts/verify.py
+
+test: all
+	$(MAKE) unload
+	$(MAKE) load
+	sudo taskset -c 5 ./client
+	$(MAKE) unload
+	python3 ./scripts/filter.py
+	gnuplot plot.pg
+	$(call pass)
